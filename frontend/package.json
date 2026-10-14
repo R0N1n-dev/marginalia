@@ -6,15 +6,21 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "predev": "node scripts/copy-pdf-assets.mjs",
+    "prebuild": "node scripts/copy-pdf-assets.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@xmldom/xmldom": "^0.9.12",
     "fflate": "^0.8.3",
+    "foliate-js": "^1.0.1",
+    "pdfjs-dist": "^6.4.299",
     "vue": "^3.5.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.0",
+    "jsdom": "^30.1.2",
     "vite": "^7.0.0"
   }
 }

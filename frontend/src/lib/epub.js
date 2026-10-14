@@ -78,11 +78,8 @@ function imageDataUrl(files, resolvedPath) {
 
 // Remove anything that could execute or escape the reader chrome, and rewrite
 // links/images to in-app forms. Book content is untrusted input.
-function sanitizeChapter(html, chapterDir, files, zipPath, titleHint) {
-  const doc = parseXml(html)
-  const body = byTag(doc, 'body')[0] || doc.documentElement
-  if (!body) return { html: '', text: '' }
-
+// Works on any DOM (xmldom in tests/parsers, live DOM for rendered docs).
+export function sanitizeTree(root, { chapterDir = '', files = null, zipPath = '' } = {}) {
   const drop = []
   const visit = (n) => {
     if (n.nodeType !== 1) return
@@ -107,7 +104,7 @@ function sanitizeChapter(html, chapterDir, files, zipPath, titleHint) {
           // keep mailto/tel as-is; anything else with a scheme is dropped
         } else if (/^[a-z][a-z0-9+.-]*:/i.test(value)) {
           n.removeAttribute('href')
-        } else {
+        } else if (files) {
           const [file, frag] = value.split('#')
           const resolved = resolvePath(chapterDir, file)
           if (resolved === zipPath) {
@@ -117,29 +114,54 @@ function sanitizeChapter(html, chapterDir, files, zipPath, titleHint) {
             if (frag) n.setAttribute('data-frag', '#' + frag)
           }
           n.removeAttribute('href')
+        } else {
+          n.removeAttribute('href') // relative link without a container: dead
         }
       } else if (name === 'src') {
-        if (/^(https?:|data:)/i.test(value)) continue
-        const resolved = resolvePath(chapterDir, value)
-        const url = imageDataUrl(files, resolved)
+        if (/^(https?:|data:|blob:)/i.test(value)) continue
+        const resolved = files ? resolvePath(chapterDir, value) : ''
+        const url = files && imageDataUrl(files, resolved)
         if (url) n.setAttribute('src', url)
         else n.removeAttribute('src')
       }
     }
     for (const c of Array.from(n.childNodes || [])) visit(c)
   }
-  visit(body)
+  visit(root)
   for (const n of drop) n.parentNode && n.parentNode.removeChild(n)
+}
 
-  // The reader renders its own chapter heading; drop the duplicate the EPUB
-  // repeats at the top of the file (must happen before text extraction so
-  // saved highlight offsets always agree with the rendered text).
-  const firstEl = Array.from(body.childNodes || []).find((c) => c.nodeType === 1)
-  if (firstEl && titleHint && /^h[1-6]$/.test((firstEl.nodeName || '').toLowerCase())) {
+// The reader renders its own chapter heading; drop the duplicate the book
+// repeats at the top of a chapter (must happen before text extraction so
+// saved highlight offsets always agree with the rendered text).
+export function stripDuplicateHeading(root, titleHint) {
+  if (!titleHint) return
+  const firstEl = Array.from(root.childNodes || []).find((c) => c.nodeType === 1)
+  if (firstEl && /^h[1-6]$/.test((firstEl.nodeName || '').toLowerCase())) {
     const norm = (x) => x.toLowerCase().replace(/^\s*\d+[.)]?\s*/, '').replace(/\s+/g, ' ').trim()
-    if (norm(textOf(firstEl)) === norm(titleHint)) body.removeChild(firstEl)
+    if (norm(textOf(firstEl)) === norm(titleHint)) root.removeChild(firstEl)
   }
+}
 
+// Public wrapper: sanitize a standalone HTML/XHTML document for single-file books.
+export function sanitizeFragment(html, titleHint) {
+  const doc = parseXml(html)
+  const body = byTag(doc, 'body')[0] || doc.documentElement
+  if (!body) return { html: '', text: '' }
+  sanitizeTree(body, {})
+  stripDuplicateHeading(body, titleHint)
+  const inner = Array.from(body.childNodes || [])
+    .map((c) => new XMLSerializer().serializeToString(c))
+    .join('')
+  return { html: inner, text: textOf(body) }
+}
+
+function sanitizeChapter(html, chapterDir, files, zipPath, titleHint) {
+  const doc = parseXml(html)
+  const body = byTag(doc, 'body')[0] || doc.documentElement
+  if (!body) return { html: '', text: '' }
+  sanitizeTree(body, { chapterDir, files, zipPath })
+  stripDuplicateHeading(body, titleHint)
   const inner = Array.from(body.childNodes || [])
     .map((c) => new XMLSerializer().serializeToString(c))
     .join('')

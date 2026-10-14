@@ -1,11 +1,11 @@
-// Global app state: library, notes, current book session, theme.
-// Persistence is one JSON document (backend decides where it lives).
+// Global app state: library, notes, bookmarks, collections, current book
+// session, theme. Persistence is one JSON document (backend decides where).
 import { reactive } from 'vue'
 import * as backend from './backend.js'
-import { parseEpub } from './epub.js'
+import { parseBook, ACCEPT_ATTR } from './formats.js'
 import { buildSampleEpub } from './sample.js'
 
-const STORE_VERSION = 1
+const STORE_VERSION = 2
 const sessionBytes = new Map() // bookId -> bytes; browser mode keeps books in memory for the session
 
 export const uid = () =>
@@ -21,6 +21,8 @@ export const state = reactive({
   fontScale: 1,
   books: [],
   notes: [],
+  collections: [],
+  collectionFilter: 'all', // 'all' | collection id
   current: null, // { book, epub, chapter }
   flash: '',
   error: '',
@@ -48,10 +50,12 @@ function persist() {
       fontScale: state.fontScale,
       books: state.books,
       notes: state.notes,
+      collections: state.collections,
     })
     backend.saveStore(data).catch(() => fail("Couldn't save your library"))
   }, 250)
 }
+export { persist }
 
 export async function init() {
   state.theme = systemTheme()
@@ -59,8 +63,9 @@ export async function init() {
     const raw = await backend.loadStore()
     if (raw) {
       const data = JSON.parse(raw)
-      state.books = data.books || []
+      state.books = (data.books || []).map((b) => ({ ...b, bookmarks: b.bookmarks || [], collectionIds: b.collectionIds || [] }))
       state.notes = data.notes || []
+      state.collections = data.collections || []
       state.fontScale = data.fontScale || 1
       if (data.theme) state.theme = data.theme
     }
@@ -87,8 +92,13 @@ const touch = (book) => { book.lastOpened = Date.now() }
 
 async function startReading(book, bytes) {
   try {
-    const epub = parseEpub(bytes)
-    state.current = { book, epub, chapter: book.chapter || 0 }
+    const epub = await parseBook(bytes, book.name)
+    book.title = epub.title || book.title
+    book.author = epub.author || book.author
+    if (epub.cover) book.cover = epub.cover
+    book.format = epub.format
+    book.totalChapters = epub.chapters.length
+    state.current = { book, epub, chapter: Math.min(book.chapter || 0, epub.chapters.length - 1) }
     state.view = 'reader'
     touch(book)
     persist()
@@ -105,7 +115,7 @@ async function ingest({ bytes, path = null, name }) {
     flash('Already in your library — opened it')
     return
   }
-  const epub = parseEpub(bytes)
+  const epub = await parseBook(bytes, name)
   const book = {
     id: uid(),
     name,
@@ -113,7 +123,11 @@ async function ingest({ bytes, path = null, name }) {
     title: epub.title,
     author: epub.author,
     cover: epub.cover,
+    format: epub.format,
+    totalChapters: epub.chapters.length,
     sample: false,
+    bookmarks: [],
+    collectionIds: [],
     addedAt: Date.now(),
     lastOpened: Date.now(),
     chapter: 0,
@@ -137,16 +151,21 @@ export async function importBook() {
   }
 }
 
-// Drag-and-drop: same path as the file dialog, just a different way in.
+// Drag-and-drop / file-input: same path as the dialog, just a different way in.
 export async function importFile(file) {
   if (!file) return
-  if (!/\.epub$/i.test(file.name) && file.type !== 'application/epub+zip') {
-    fail('Only .epub files can be imported')
-    return
-  }
+  const known = ACCEPT_ATTR.split(',').some((ext) => ext.startsWith('.') && file.name.toLowerCase().endsWith(ext))
   try {
     state.busy = true
-    await ingest({ bytes: new Uint8Array(await file.arrayBuffer()), path: null, name: file.name })
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    if (!known) {
+      const { detectFormat } = await import('./formats.js')
+      if (detectFormat(bytes, file.name) === 'txt') {
+        fail('Unsupported file type')
+        return
+      }
+    }
+    await ingest({ bytes, path: null, name: file.name })
   } catch (e) {
     fail(e.message || 'That file could not be imported')
   } finally {
@@ -162,10 +181,11 @@ export async function loadSample() {
     await startReading(existing, bytes)
     return
   }
-  const epub = parseEpub(bytes)
+  const epub = await parseBook(bytes, 'the-salt-path-sample.epub')
   const book = {
     id: uid(), name: 'the-salt-path-sample.epub', path: null, title: epub.title,
-    author: epub.author, cover: epub.cover, sample: true,
+    author: epub.author, cover: epub.cover, format: 'epub', totalChapters: epub.chapters.length,
+    sample: true, bookmarks: [], collectionIds: [],
     addedAt: Date.now(), lastOpened: Date.now(), chapter: 0,
   }
   sessionBytes.set(book.id, bytes)
@@ -215,9 +235,63 @@ export function goToChapter(i) {
   saveProgress()
 }
 
-// ---- notes ----
-export function noteKey(note) { return note }
+/* ---------- bookmarks ---------- */
+export function isBookmarked(chapter, page) {
+  const b = state.current && state.current.book
+  return !!(b && (b.bookmarks || []).some((m) => m.chapter === chapter && m.page === page))
+}
+export function toggleBookmark(chapter, page, label) {
+  const b = state.current && state.current.book
+  if (!b) return
+  b.bookmarks = b.bookmarks || []
+  const at = b.bookmarks.findIndex((m) => m.chapter === chapter && m.page === page)
+  if (at >= 0) {
+    b.bookmarks.splice(at, 1)
+    flash('Bookmark removed')
+  } else {
+    b.bookmarks.push({ id: uid(), chapter, page, label, createdAt: Date.now() })
+    flash('Bookmarked')
+  }
+  persist()
+}
+export function removeBookmark(bookId, bookmarkId) {
+  const b = state.books.find((x) => x.id === bookId)
+  if (!b || !b.bookmarks) return
+  b.bookmarks = b.bookmarks.filter((m) => m.id !== bookmarkId)
+  persist()
+}
+export function goToBookmark(bm) {
+  if (!state.current) return
+  goToChapter(bm.chapter)
+  return bm.page || 0 // reader restores the page after the chapter watcher runs
+}
 
+/* ---------- collections ---------- */
+export function addCollection(name) {
+  const clean = (name || '').trim()
+  if (!clean) return null
+  const existing = state.collections.find((c) => c.name.toLowerCase() === clean.toLowerCase())
+  if (existing) return existing
+  const col = { id: uid(), name: clean, createdAt: Date.now() }
+  state.collections.push(col)
+  persist()
+  return col
+}
+export function removeCollection(id) {
+  state.collections = state.collections.filter((c) => c.id !== id)
+  for (const b of state.books) b.collectionIds = (b.collectionIds || []).filter((c) => c !== id)
+  if (state.collectionFilter === id) state.collectionFilter = 'all'
+  persist()
+}
+export function toggleInCollection(book, colId) {
+  book.collectionIds = book.collectionIds || []
+  const at = book.collectionIds.indexOf(colId)
+  if (at >= 0) book.collectionIds.splice(at, 1)
+  else book.collectionIds.push(colId)
+  persist()
+}
+
+/* ---------- notes ---------- */
 export function addNote({ chapter, start, end, color, quote, note = '', tags = [] }) {
   if (!state.current) return null
   const n = {
@@ -244,14 +318,7 @@ export function deleteNote(id) {
 export const notesOfCurrentChapter = () =>
   state.current ? state.notes.filter((n) => n.bookId === state.current.book.id && n.chapter === state.current.chapter) : []
 export const notesOfBook = (bookId) => state.notes.filter((n) => n.bookId === bookId)
-export const notesByBook = () => {
-  const out = []
-  for (const b of state.books) {
-    const ns = state.notes.filter((n) => n.bookId === b.id)
-    if (ns.length) out.push({ book: b, notes: ns })
-  }
-  return out
-}
+
 export function removeBook(id) {
   state.books = state.books.filter((b) => b.id !== id)
   state.notes = state.notes.filter((n) => n.bookId !== id)

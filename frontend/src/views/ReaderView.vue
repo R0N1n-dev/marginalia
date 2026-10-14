@@ -1,14 +1,16 @@
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import {
-  state, goToChapter, saveProgress, addNote,
-  notesOfCurrentChapter, setFontScale, flash,
+  state, goToChapter, saveProgress, addNote, flash,
+  notesOfCurrentChapter, setFontScale,
+  isBookmarked, toggleBookmark, removeBookmark,
 } from '../lib/store.js'
 import { openExternal } from '../lib/backend.js'
 import { textLength, absOffset, locate, applyMark, unwrapMarks } from '../lib/marks.js'
 import MarginaliaPanel from './MarginaliaPanel.vue'
 
 const vp = ref(null)      // scroll viewport
+const pdfCanvas = ref(null) // pdf page render target
 const flow = ref(null)    // column container (own heading + book text)
 const body = ref(null)    // book text only — highlight offsets are measured here
 
@@ -25,7 +27,13 @@ const editingId = ref('')
 let PAGE = 620
 let GAP = 44
 let pendingOffset = null
+let pendingPage = null
 let ro = null
+let pdfMod = null
+let pdfBook = null
+let renderSeq = 0
+let pdfResizeTimer = null
+const findBusy = ref(false)
 
 const book = computed(() => state.current && state.current.book)
 const epub = computed(() => state.current && state.current.epub)
@@ -44,6 +52,12 @@ const percent = computed(() => {
   return Math.min(100, Math.round(((idx.value + (page.value + 1) / pages.value) / total) * 100))
 })
 const bodyLen = computed(() => (body.value ? textLength(body.value) : 1))
+const isPdf = computed(() => !!(state.current && state.current.epub && state.current.epub.format === 'pdf'))
+const bookmarks = computed(() => {
+  const b = state.current && state.current.book
+  return [...((b && b.bookmarks) || [])].sort((x, y) => x.chapter - y.chapter || (x.page || 0) - (y.page || 0))
+})
+const bookmarked = computed(() => isBookmarked(idx.value, page.value))
 
 const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
 
@@ -74,6 +88,31 @@ async function layout({ keepPage = true, marks = true } = {}) {
     pendingOffset = null
     await scrollToOffset(off)
   }
+}
+
+async function loadPdfMod() {
+  if (!pdfMod) pdfMod = await import('../lib/pdf.js')
+  return pdfMod
+}
+async function renderCurrentPdf() {
+  if (!isPdf.value || !epub.value || !vp.value || !pdfCanvas.value) return
+  pdfBook = epub.value
+  const seq = ++renderSeq
+  try {
+    const mod = await loadPdfMod()
+    if (seq !== renderSeq) return
+    await mod.renderPdfPage(
+      epub.value, idx.value, pdfCanvas.value,
+      Math.max(240, vp.value.clientWidth - 48),
+      Math.max(240, vp.value.clientHeight - 36),
+    )
+  } catch (e) {
+    if (seq === renderSeq) flash('Could not render that PDF page')
+  }
+}
+function schedulePdfRender() {
+  clearTimeout(pdfResizeTimer)
+  pdfResizeTimer = setTimeout(renderCurrentPdf, 150)
 }
 
 function applyScroll(smooth) {
@@ -218,6 +257,26 @@ async function scrollToOffset(off) {
   if (node) await scrollToElement(node)
 }
 
+function bmLabel() {
+  if (isPdf.value) return `Page ${idx.value + 1}`
+  return chapterTitle.value + (pages.value > 1 ? ` · p.${page.value + 1}` : '')
+}
+function toggleBm() { toggleBookmark(idx.value, page.value, bmLabel()) }
+function jumpBookmark(bm) {
+  if (bm.chapter === idx.value) setPage(bm.page || 0)
+  else { pendingPage = bm.page || 0; goToChapter(bm.chapter) }
+}
+function createPageNote() {
+  const n = addNote({
+    chapter: idx.value, start: 0, end: 0, color: 'sun',
+    quote: `Page ${idx.value + 1}`,
+  })
+  if (n) {
+    activeNoteId.value = n.id
+    editingId.value = n.id
+  }
+}
+
 function onNoteSelect(id) {
   activeNoteId.value = id
   const mark = body.value && body.value.querySelector('[data-hl="' + id + '"]')
@@ -226,7 +285,15 @@ function onNoteSelect(id) {
 function stopEdit() { editingId.value = '' }
 
 /* ---------- find in book ---------- */
-function runFind() {
+async function runFind() {
+  if (isPdf.value && epub.value && !epub.value.textReady) {
+    findBusy.value = true
+    try {
+      const mod = await loadPdfMod()
+      await mod.ensurePdfText(epub.value)
+    } catch (e) { /* leave results empty */ }
+    findBusy.value = false
+  }
   const q = findQ.value.trim().toLowerCase()
   results.value = []
   if (!q || !epub.value) return
@@ -303,7 +370,14 @@ watch(() => state.current && state.current.chapter, async () => {
   clearSelection()
   await nextTick()
   await layout({ keepPage: false })
+  if (pendingPage !== null) {
+    const p = pendingPage
+    pendingPage = null
+    page.value = 0
+    setPage(p)
+  }
   await flushFrag()
+  if (isPdf.value) renderCurrentPdf()
 })
 watch(() => state.fontScale, () => layout({ keepPage: true }))
 watch([showFind], () => { if (!showFind.value) findQ.value = '' })
@@ -312,20 +386,27 @@ onMounted(async () => {
   window.addEventListener('keydown', onKey)
   window.addEventListener('mousedown', onDocDown)
   if (window.ResizeObserver) {
-    ro = new ResizeObserver(() => layout({ keepPage: true }))
+    ro = new ResizeObserver(() => {
+      layout({ keepPage: true })
+      if (isPdf.value) schedulePdfRender()
+    })
     ro.observe(vp.value)
   } else {
     window.addEventListener('resize', onResize)
   }
   await layout({ keepPage: false })
   await flushFrag()
+  if (isPdf.value) renderCurrentPdf()
 })
-function onResize() { layout({ keepPage: true }) }
+function onResize() { layout({ keepPage: true }); if (isPdf.value) schedulePdfRender() }
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('mousedown', onDocDown)
   window.removeEventListener('resize', onResize)
   if (ro) ro.disconnect()
+  clearTimeout(pdfResizeTimer)
+  if (pdfBook && pdfMod) pdfMod.destroyPdf(pdfBook)
+  pdfBook = null
   saveProgress()
 })
 
@@ -336,7 +417,8 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
   <div class="reader" v-if="chapter">
     <!-- contents / find -->
     <nav class="toccol" v-if="showToc" aria-label="Contents">
-      <div v-if="!showFind" class="toc">
+      <template v-if="!showFind">
+      <div class="toc">
         <div class="th">Contents</div>
         <a v-for="(e, i) in epub.toc" :key="i" href="#"
           :class="{ on: e.href === chapter.path && !e.frag }"
@@ -345,13 +427,25 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
           <span class="lbl">{{ e.label }}</span>
         </a>
       </div>
-      <div v-else class="find">
+      <div v-if="bookmarks.length" class="bmsec">
+        <div class="th">Bookmarks</div>
+        <div v-for="bm in bookmarks" :key="bm.id" class="bmrow">
+          <button class="bmlink" :title="bm.label" @click="jumpBookmark(bm)">{{ bm.label }}</button>
+          <button class="iconbtn bmrm" title="Remove bookmark" aria-label="Remove bookmark"
+            @click="removeBookmark(book.id, bm.id)">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+          </button>
+        </div>
+      </div>
+      </template>
+      <div v-if="showFind" class="find">
         <div class="th">Find in book</div>
         <label class="search fsearch">
           <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
           <input v-model="findQ" placeholder="Search…" aria-label="Search in book" @input="runFind" />
         </label>
         <div class="fresults">
+          <p v-if="findBusy" class="fhint">Reading the PDF…</p>
           <button v-for="(r, i) in results" :key="i" class="fresult" @click="jumpToResult(r)">
             <span class="fchap">Ch. {{ r.chapter + 1 }}</span>
             <span class="fsnip">{{ r.snippet }}</span>
@@ -373,6 +467,14 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
         </button>
         <span class="where"><b>{{ chapterTitle }}</b> · chapter {{ idx + 1 }} of {{ epub.chapters.length }}</span>
         <span class="right">
+          <button v-if="isPdf" class="iconbtn" title="Add a note for this page" aria-label="Add a note for this page" @click="createPageNote">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <button class="iconbtn" :class="{ on: bookmarked }"
+            :title="bookmarked ? 'Remove bookmark' : 'Bookmark this page'"
+            :aria-label="bookmarked ? 'Remove bookmark' : 'Bookmark this page'" @click="toggleBm">
+            <svg viewBox="0 0 24 24"><path d="M7 4h10v16l-5-4-5 4z" :fill="bookmarked ? 'currentColor' : 'none'"/></svg>
+          </button>
           <button class="iconbtn" title="Smaller text" aria-label="Smaller text" @click="setFontScale(-0.1)">
             <svg viewBox="0 0 24 24"><path d="M5 12h14" /></svg>
           </button>
@@ -384,7 +486,7 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
       </div>
 
       <div class="viewport" ref="vp" @mouseup="onSelect" @click="onBodyClick">
-        <article class="flow" ref="flow" :style="{ fontSize: 16.5 * state.fontScale + 'px' }">
+        <article v-if="!isPdf" class="flow" ref="flow" :style="{ fontSize: 16.5 * state.fontScale + 'px' }">
           <div class="chnum">Chapter {{ idx + 1 }}</div>
           <h3>{{ chapterTitle }}</h3>
           <div class="body" ref="body" v-html="chapter.html"></div>
@@ -395,6 +497,7 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
               @click="onNoteSelect(n.id)"></i>
           </div>
         </article>
+        <canvas v-else ref="pdfCanvas" class="pdfcanvas" aria-label="PDF page"></canvas>
 
         <div v-if="selection" class="pop" :style="popStyle" role="toolbar" aria-label="Highlight actions" @mousedown.prevent>
           <button class="dot" style="background: var(--sun)" title="Highlight in yellow" @click="createHighlight('sun')"></button>
@@ -622,5 +725,26 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
 @media (max-width: 980px) {
   .toccol { display: none; }
   .notecount { display: none; }
+}
+</style>
+
+<style scoped>
+.bmsec { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 4px; }
+.bmrow { display: flex; align-items: center; gap: 2px; padding: 2px 10px 2px 18px; }
+.bmlink {
+  flex: 1; min-width: 0; text-align: left;
+  border: 0; background: transparent; cursor: pointer;
+  font: inherit; font-size: 12.5px; color: var(--ink-soft);
+  padding: 5px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bmlink:hover { color: var(--ink); }
+.bmrm { width: 24px; height: 24px; opacity: 0; flex: none; }
+.bmrow:hover .bmrm, .bmrm:focus-visible { opacity: 1; }
+.bmrm svg { width: 12px; height: 12px; }
+
+.pdfcanvas {
+  position: absolute; inset: 0; margin: auto;
+  box-shadow: var(--shadow-menu); border-radius: 2px;
+  max-width: calc(100% - 24px); max-height: calc(100% - 24px);
 }
 </style>

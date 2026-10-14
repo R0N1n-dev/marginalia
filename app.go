@@ -32,7 +32,8 @@ func (a *App) PickEpub() (string, error) {
 	return runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
 		Title: "Import EPUB",
 		Filters: []runtime.FileFilter{
-			{DisplayName: "EPUB books (*.epub)", Pattern: "*.epub"},
+			{DisplayName: "Ebooks & documents", Pattern: "*.epub;*.fb2;*.zip;*.mobi;*.azw;*.azw3;*.prc;*.pdf;*.txt;*.md;*.html;*.htm"},
+			{DisplayName: "All files", Pattern: "*"},
 		},
 	})
 }

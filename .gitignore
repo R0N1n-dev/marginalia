@@ -1,13 +1,5 @@
-# dependencies
-node_modules/
-
-# wails build output
-build/bin/
-frontend/dist/
-
-# logs
-*.log
-
-# stray local build output
+build/bin
 /marg
-marg.exe
+node_modules
+frontend/dist
+frontend/public/pdfjs/

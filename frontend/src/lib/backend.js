@@ -3,6 +3,7 @@
 // in the browser. Everything else in the app only talks to this module.
 import { PickEpub, PickSavePath, ReadFileB64, ReadStore, WriteStore, WriteFileB64, OpenExternal } from '../../wailsjs/go/main/App'
 import { toBase64 } from './epub.js'
+import { ACCEPT_ATTR } from './formats.js'
 
 export const isWails = () => !!(window.go && window.go.main && window.go.main.App)
 
@@ -24,7 +25,7 @@ export async function pickEpubBytes() {
   return new Promise((resolve) => {
     const input = document.createElement('input')
     input.type = 'file'
-    input.accept = '.epub,application/epub+zip'
+    input.accept = ACCEPT_ATTR
     input.addEventListener('change', async () => {
       const f = input.files && input.files[0]
       resolve(f ? { path: null, name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) } : null)
