@@ -13,7 +13,7 @@ import {
 import MarginaliaPanel from './MarginaliaPanel.vue'
 
 const room = ref(null)    // reading room: centres the page and clips what surrounds it
-const vp = ref(null)      // the page itself — a scroll box exactly one column wide
+const vp = ref(null)      // the page: a box exactly one page wide that clips the flow
 const pdfCanvas = ref(null) // pdf page render target
 const flow = ref(null)    // column container (own heading + book text)
 const body = ref(null)    // book text only — highlight offsets are measured here
@@ -417,7 +417,6 @@ function onKey(e) {
     if (state.focus) { toggleFocus(); showToc.value = true }
     else showToc.value = !showToc.value
   }
-
   else if (k === 'b' || k === 'B') { toggleBm() }
   else if (k === '?' || (k === '/' && e.shiftKey)) { showHelp.value = !showHelp.value }
   else if (k === 'Escape') {
@@ -432,6 +431,7 @@ function onKey(e) {
 async function toggleFocusMode() {
   const wasNativeSelection = selection.value
   toggleFocus()
+  if (state.focus) flash('Focus mode — Esc to leave')
   if (wasNativeSelection) clearSelection()
   await nextTick()
   await layout({ keepPage: true })
@@ -573,12 +573,13 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
 
       <div class="viewport" ref="room" :class="{ framed }" @mouseup="onSelect" @click="onBodyClick">
         <!-- page-edge flags for the highlights on this page (pagebox gutter) -->
-        <div v-if="framed && pageFlags.length" class="flags" aria-hidden="true">
-          <i v-for="f in pageFlags" :key="f.id" class="flag"
+        <div v-if="framed && pageFlags.length" class="flags">
+          <button v-for="f in pageFlags" :key="f.id" type="button" class="flag"
             :class="{ active: f.id === activeNoteId }"
             :style="{ background: COLORS[f.color] || COLORS.sun, top: f.top + '%' }"
             :title="f.quote"
-            @click="onNoteSelect(f.id)"></i>
+            :aria-label="'Highlight: ' + f.quote"
+            @click="onNoteSelect(f.id)"></button>
         </div>
 
         <!-- exactly one page wide: the rest of the chapter is clipped away -->
@@ -609,12 +610,11 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
           <svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7" /></svg>
         </button>
 
-        <!-- the only chrome left in focus mode: a way back, and where you are -->
+        <!-- the only chrome left in focus mode: a way back, on hover -->
         <button v-if="state.focus" class="fexit" title="Exit focus mode (Esc)" aria-label="Exit focus mode" @click="toggleFocusMode">
           <svg viewBox="0 0 24 24"><path d="M9 4H4v5M15 4h5v5M15 20h5v-5M9 20H4v-5" /></svg>
           <span>Esc</span>
         </button>
-        <span v-if="state.focus" class="fpos">{{ percent }}%</span>
       </div>
 
       <div class="scrub" v-if="!state.focus">
@@ -849,22 +849,17 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
 }
 .flag:hover, .flag.active { width: 22px; opacity: 1; }
 
-/* focus mode chrome: a quiet way out and where you are */
+/* focus mode chrome: a quiet way out, revealed on hover */
 .fexit {
   position: absolute; right: 14px; bottom: 10px; z-index: 22;
   display: inline-flex; align-items: center; gap: 6px;
   height: 26px; padding: 0 10px; border-radius: 14px; cursor: pointer;
   border: 1px solid var(--line); background: var(--panel); color: var(--ink-soft);
-  font-size: 11.5px; opacity: .45;
+  font-size: 11.5px; opacity: 0;
   transition: opacity .15s ease;
 }
 .viewport:hover .fexit, .fexit:focus-visible { opacity: 1; }
 .fexit svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.fpos {
-  position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%);
-  z-index: 22; font-size: 11.5px; color: var(--ink-faint);
-  font-variant-numeric: tabular-nums; pointer-events: none; opacity: .7;
-}
 
 /* keyboard reference */
 .helpsheet {
