@@ -47,8 +47,9 @@ function parseHtml(bytes, name) {
 export async function parseBook(bytes, name = '') {
   let fmt = detectFormat(bytes, name)
   if (fmt === 'zip') {
+    // fflate hands the filter an info object, not a bare path.
     const files = unzipSync(bytes, {
-      filter: (path) => path === 'META-INF/container.xml' || /\.fb2$/i.test(path),
+      filter: (f) => f.name === 'META-INF/container.xml' || /\.fb2$/i.test(f.name),
     })
     if (files['META-INF/container.xml']) fmt = 'epub'
     else if (Object.keys(files).some((k) => /\.fb2$/i.test(k))) fmt = 'fb2'

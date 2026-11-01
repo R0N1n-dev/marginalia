@@ -11,9 +11,19 @@ annotate, bookmark and organise your books — in light or dark.
   onto the window or use Import; format badges show what's what.
 - **Reading** — paginated EPUB flow with a table-of-contents rail, nested chapters, a bottom
   scrubber with time-remaining, resume-where-you-left-off, and per-page navigation for PDFs.
+  Pages are true single pages: the column flow is clipped to exactly one page wide, so the
+  next page never peeks in at the edge, the text gets a comfortable measure and the page sits
+  centred with margins on wide windows.
+- **Focus mode** — press `f` (or the frame button) to drop everything but the page: rails,
+  contents, marginalia and scrubber step aside, a hairline at the top of the window shows how
+  far through the book you are, and `Esc` brings it all back. Your place is kept.
+- **Keyboard** — `←` `→` / `Space` to turn pages, `Home` `End` for the ends of a chapter,
+  `f` focus, `t` contents, `b` bookmark, `+` `−` text size, `?` for the full list. Paging
+  backwards past the start of a chapter lands on the previous chapter's last page.
 - **Highlighting & notes** — select text, pick one of four highlighter colours, attach a note.
-  Highlights render as colored flags on the page edge; notes appear in the *marginalia* rail
-  beside the text they belong to. PDFs get page-level notes.
+  Highlights render as colored flags on the page edge — each flag sits on the page where its
+  highlight actually is, at the right height; notes appear in the *marginalia* rail beside the
+  text they belong to. PDFs get page-level notes.
 - **Notes overview** — every highlight across every book, filtered by book or colour, with
   tags, search, and **Markdown export**.
 - **Bookmarks** — flag a page or passage and jump back to it from the reader.
@@ -36,6 +46,7 @@ annotate, bookmark and organise your books — in light or dark.
 | MOBI/AZW3 | [foliate-js](https://github.com/johnfactotum/foliate-js) (MIT), lazy-loaded |
 | PDF | [pdf.js](https://mozilla.github.io/pdf.js/) (Apache-2.0), lazy-loaded with its worker |
 | FB2 / HTML / TXT | own parsers over a shared sanitizer |
+| Pagination | CSS multi-column flow, one column per page (`lib/paginate.js`) |
 
 Parsers are pure JavaScript and unit-tested in Node (`npm test`) — no browser required.
 Highlights store character offsets into the extracted chapter text, so they survive
@@ -47,7 +58,8 @@ re-pagination and font-size changes.
 main.go / app.go        Wails bindings: file dialogs, reads, JSON store, external links
 frontend/src/
   backend/              thin API layer (Wails in the app, browser stubs in dev)
-  lib/                  parsers: epub, mobi, pdf, fb2, text, html, dispatch, sanitizer, marks
+  lib/                  parsers: epub, mobi, pdf, fb2, text, html, dispatch, sanitizer, marks,
+                        paginate (page geometry)
   stores/               library, reading state, highlights, collections, theme
   views/                LibraryView, ReaderView, NotesView
   components/           marginalia rail, nav, popover, …
@@ -69,7 +81,7 @@ In the browser dev server the Go layer is swapped for browser stubs (File picker
 ### Tests
 
 ```sh
-npm --prefix frontend test      # 21 tests: parsers, offsets, dispatch, FB2, MOBI (real file), PDF
+npm --prefix frontend test      # 28 tests: parsers, offsets, pagination, dispatch, FB2, MOBI, PDF
 ```
 
 ### Build

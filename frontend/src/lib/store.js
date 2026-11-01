@@ -19,6 +19,7 @@ export const state = reactive({
   libQuery: '',
   theme: 'light',
   fontScale: 1,
+  focus: false, // distraction-free reading: only the page, no chrome
   books: [],
   notes: [],
   collections: [],
@@ -48,6 +49,7 @@ function persist() {
       v: STORE_VERSION,
       theme: state.theme,
       fontScale: state.fontScale,
+      focus: state.focus,
       books: state.books,
       notes: state.notes,
       collections: state.collections,
@@ -67,6 +69,7 @@ export async function init() {
       state.notes = data.notes || []
       state.collections = data.collections || []
       state.fontScale = data.fontScale || 1
+      state.focus = !!data.focus
       if (data.theme) state.theme = data.theme
     }
   } catch (e) {
@@ -87,6 +90,11 @@ export function setFontScale(delta) {
   state.fontScale = Math.min(1.6, Math.max(0.8, Math.round((state.fontScale + delta) * 10) / 10))
   persist()
 }
+export function setFocus(on) {
+  state.focus = !!on
+  persist()
+}
+export function toggleFocus() { setFocus(!state.focus) }
 
 const touch = (book) => { book.lastOpened = Date.now() }
 

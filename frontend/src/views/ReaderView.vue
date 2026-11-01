@@ -3,13 +3,17 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import {
   state, goToChapter, saveProgress, addNote, flash,
   notesOfCurrentChapter, setFontScale,
-  isBookmarked, toggleBookmark, removeBookmark,
+  isBookmarked, toggleBookmark, removeBookmark, toggleFocus,
 } from '../lib/store.js'
 import { openExternal } from '../lib/backend.js'
 import { textLength, absOffset, locate, applyMark, unwrapMarks } from '../lib/marks.js'
+import {
+  columnWidth, pagesInFlow, scrollLeftFor, pageAt, railPercent,
+} from '../lib/paginate.js'
 import MarginaliaPanel from './MarginaliaPanel.vue'
 
-const vp = ref(null)      // scroll viewport
+const room = ref(null)    // reading room: centres the page and clips what surrounds it
+const vp = ref(null)      // the page itself — a scroll box exactly one column wide
 const pdfCanvas = ref(null) // pdf page render target
 const flow = ref(null)    // column container (own heading + book text)
 const body = ref(null)    // book text only — highlight offsets are measured here
@@ -18,14 +22,20 @@ const page = ref(0)
 const pages = ref(1)
 const showToc = ref(true)
 const showFind = ref(false)
-const findQ = ref('')
-const results = ref([])
+const showHelp = ref(false)
+const framed = ref(false)      // room to spare around the page → draw its edges
+const pageFlags = ref([])      // highlight flags that belong to the current page
 const selection = ref(null) // {start, end, rect}
 const activeNoteId = ref('')
 const editingId = ref('')
+const findQ = ref('')
+const results = ref([])
+const findBusy = ref(false)
 
-let PAGE = 620
-let GAP = 44
+let PAGE = 620 // width of one page (the visible box)
+let COL = 570 // text measure inside it
+let INSET = 25 // gutter between the text and the page edge
+let GAP = 50 // gutter between two columns (== both page gutters)
 let pendingOffset = null
 let pendingPage = null
 let ro = null
@@ -33,7 +43,6 @@ let pdfMod = null
 let pdfBook = null
 let renderSeq = 0
 let pdfResizeTimer = null
-const findBusy = ref(false)
 
 const book = computed(() => state.current && state.current.book)
 const epub = computed(() => state.current && state.current.epub)
@@ -51,7 +60,6 @@ const percent = computed(() => {
   const total = epub.value.chapters.length
   return Math.min(100, Math.round(((idx.value + (page.value + 1) / pages.value) / total) * 100))
 })
-const bodyLen = computed(() => (body.value ? textLength(body.value) : 1))
 const isPdf = computed(() => !!(state.current && state.current.epub && state.current.epub.format === 'pdf'))
 const bookmarks = computed(() => {
   const b = state.current && state.current.book
@@ -61,28 +69,34 @@ const bookmarked = computed(() => isBookmarked(idx.value, page.value))
 
 const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches
 
-/* ---------- pagination: CSS columns, one column per screen ---------- */
+/* ---------- pagination: CSS columns, exactly one column visible ----------
+   The chapter is laid out as a column flow inside `.pagebox`, a scroll box that
+   is *exactly one page wide* (PAGE). Everything past its right edge — the
+   following columns — is clipped instead of peeking into the reading room, and
+   the page is centred so wide windows get margins rather than half a neighbour.
+   The text measure is narrower than the page by a gutter either side; the
+   column gap equals both gutters, so one page turn is exactly PAGE pixels. */
 async function layout({ keepPage = true, marks = true } = {}) {
   const v = vp.value
-  if (!v || !flow.value) return
-  PAGE = Math.max(300, Math.min(660, v.clientWidth - 48))
-  GAP = Math.round(PAGE * 0.07)
-  flow.value.style.width = PAGE + 'px'
-  flow.value.style.columnWidth = PAGE + 'px'
+  const r = room.value
+  if (!v || !r || !flow.value) return
+  PAGE = columnWidth(r.clientWidth)
+  INSET = Math.max(8, Math.min(26, Math.round(PAGE * 0.06)))
+  COL = PAGE - INSET * 2
+  GAP = INSET * 2
+  framed.value = r.clientWidth - PAGE >= 40
+  r.style.setProperty('--pagew', PAGE + 'px')
+  v.style.width = PAGE + 'px'
+  flow.value.style.width = COL + 'px'
+  flow.value.style.columnWidth = COL + 'px'
   flow.value.style.columnGap = GAP + 'px'
   await nextTick()
-  const sw = v.scrollWidth
-  const cw = v.clientWidth
-  if (sw <= cw + 1) {
-    pages.value = 1
-  } else {
-    const flowLeft = flow.value.getBoundingClientRect().left - v.getBoundingClientRect().left
-    pages.value = Math.max(1, Math.round((sw - flowLeft - PAGE) / (PAGE + GAP)) + 1)
-  }
+  pages.value = pagesInFlow(flow.value.scrollWidth, COL, GAP)
   if (!keepPage) page.value = 0
   page.value = Math.min(page.value, pages.value - 1)
   applyScroll(false)
   if (marks) applyMarks()
+  positionFlags()
   if (pendingOffset !== null) {
     const off = pendingOffset
     pendingOffset = null
@@ -90,12 +104,14 @@ async function layout({ keepPage = true, marks = true } = {}) {
   }
 }
 
+const step = () => COL + GAP // where one page starts relative to the last
+
 async function loadPdfMod() {
   if (!pdfMod) pdfMod = await import('../lib/pdf.js')
   return pdfMod
 }
 async function renderCurrentPdf() {
-  if (!isPdf.value || !epub.value || !vp.value || !pdfCanvas.value) return
+  if (!isPdf.value || !epub.value || !room.value || !pdfCanvas.value) return
   pdfBook = epub.value
   const seq = ++renderSeq
   try {
@@ -103,8 +119,8 @@ async function renderCurrentPdf() {
     if (seq !== renderSeq) return
     await mod.renderPdfPage(
       epub.value, idx.value, pdfCanvas.value,
-      Math.max(240, vp.value.clientWidth - 48),
-      Math.max(240, vp.value.clientHeight - 36),
+      Math.max(240, room.value.clientWidth - 48),
+      Math.max(240, room.value.clientHeight - 36),
     )
   } catch (e) {
     if (seq === renderSeq) flash('Could not render that PDF page')
@@ -115,17 +131,23 @@ function schedulePdfRender() {
   pdfResizeTimer = setTimeout(renderCurrentPdf, 150)
 }
 
+/* Page turns are a transform on the column flow, not a scroll: the page box
+   clips, so only the current page can ever be seen, and the last page needs no
+   trailing slack to land flush. */
 function applyScroll(smooth) {
-  if (!vp.value) return
-  const left = page.value * (PAGE + GAP)
-  const behavior = smooth && !reducedMotion() ? 'smooth' : 'auto'
-  vp.value.scrollTo ? vp.value.scrollTo({ left, behavior }) : (vp.value.scrollLeft = left)
+  const f = flow.value
+  if (!f) return
+  const animate = smooth && !reducedMotion()
+  f.style.transition = animate ? 'transform .26s cubic-bezier(.2,.7,.2,1)' : 'none'
+  f.style.transform = `translateX(${-scrollLeftFor(page.value, step())}px)`
+  positionFlags()
 }
 function setPage(n) {
   const next = Math.max(0, Math.min(pages.value - 1, n))
   if (next === page.value) return
   page.value = next
   applyScroll(true)
+  clearSelection()
 }
 async function nextPage() {
   if (page.value < pages.value - 1) setPage(page.value + 1)
@@ -133,7 +155,7 @@ async function nextPage() {
 }
 async function prevPage() {
   if (page.value > 0) setPage(page.value - 1)
-  else if (idx.value > 0) { goToChapter(idx.value - 1); await nextTick(); }
+  else if (idx.value > 0) { pendingPage = -1; goToChapter(idx.value - 1) } // land on its last page
 }
 
 /* ---------- highlights ---------- */
@@ -146,6 +168,34 @@ function applyMarks() {
     if (n.start >= len) continue
     applyMark(document, b, n.start, Math.min(n.end, len), n.id)
   }
+  positionFlags()
+}
+
+/* Page-edge flags: only the highlights that live on the page you are reading,
+   placed at their true height on it. The page a highlight falls on is measured
+   relative to the flow's own rect, so the page-turn transform cancels out and
+   the flags stay correct even mid-turn. */
+function positionFlags() {
+  const b = body.value
+  const v = vp.value
+  if (!b || !v || !framed.value || !chapterNotes.value.length) { pageFlags.value = []; return }
+  const box = v.getBoundingClientRect()
+  const flowLeft = flow.value.getBoundingClientRect().left
+  const len = textLength(b)
+  const out = []
+  for (const n of chapterNotes.value) {
+    const start = Math.max(0, n.start)
+    const end = Math.min(n.end, len)
+    if (end <= start) continue // page-level notes (PDFs) have no text to point at
+    const loc = locate(b, start, end)
+    if (!loc) continue
+    const node = loc[0].nodeType === 3 ? loc[0].parentElement : loc[0]
+    if (!node || !node.getBoundingClientRect) continue
+    const r = node.getBoundingClientRect()
+    if (pageAt(r.left, flowLeft, step()) !== page.value) continue
+    out.push({ id: n.id, color: n.color, quote: n.quote, top: railPercent(r.top + 4, box.top, box.height) })
+  }
+  pageFlags.value = out
 }
 
 function onSelect() {
@@ -239,13 +289,10 @@ async function flushFrag() {
 async function scrollToElement(el) {
   await nextTick()
   if (!vp.value || !flow.value) return
-  vp.value.scrollLeft = 0
-  page.value = 0
-  await nextTick()
+  // both rects carry the page-turn transform, so the difference is the
+  // element's offset within the un-transformed column flow
   const flowLeft = flow.value.getBoundingClientRect().left
-  const r = el.getBoundingClientRect()
-  const col = Math.round((r.left - flowLeft) / (PAGE + GAP))
-  setPage(Math.max(0, Math.min(pages.value - 1, col)))
+  setPage(pageAt(el.getBoundingClientRect().left, flowLeft, step()))
 }
 
 async function scrollToOffset(off) {
@@ -355,12 +402,39 @@ function onDocDown(e) {
 function onKey(e) {
   const t = e.target
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) {
-    if (e.key === 'Escape') { showFind.value = false; t.blur() }
+    if (e.key === 'Escape') { showFind.value = false; showHelp.value = false; t.blur() }
     return
   }
-  if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') { e.preventDefault(); nextPage() }
-  else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prevPage() }
-  else if (e.key === 'Escape') { clearSelection(); if (showFind.value) showFind.value = false }
+  const k = e.key
+  if (k === 'ArrowRight' || k === 'PageDown' || k === ' ') { e.preventDefault(); nextPage() }
+  else if (k === 'ArrowLeft' || k === 'PageUp') { e.preventDefault(); prevPage() }
+  else if (k === 'Home') { e.preventDefault(); setPage(0) }
+  else if (k === 'End') { e.preventDefault(); setPage(pages.value - 1) }
+  else if (k === '+' || k === '=') { e.preventDefault(); setFontScale(0.1) }
+  else if (k === '-' || k === '_') { e.preventDefault(); setFontScale(-0.1) }
+  else if (k === 'f' || k === 'F') { toggleFocusMode() }
+  else if (k === 't' || k === 'T') {
+    if (state.focus) { toggleFocus(); showToc.value = true }
+    else showToc.value = !showToc.value
+  }
+
+  else if (k === 'b' || k === 'B') { toggleBm() }
+  else if (k === '?' || (k === '/' && e.shiftKey)) { showHelp.value = !showHelp.value }
+  else if (k === 'Escape') {
+    if (showHelp.value) { showHelp.value = false; return }
+    if (state.focus) { toggleFocusMode(); return }
+    clearSelection()
+    if (showFind.value) showFind.value = false
+  }
+}
+
+/* Toggle distraction-free reading; the page keeps its place. */
+async function toggleFocusMode() {
+  const wasNativeSelection = selection.value
+  toggleFocus()
+  if (wasNativeSelection) clearSelection()
+  await nextTick()
+  await layout({ keepPage: true })
 }
 
 /* ---------- lifecycle ---------- */
@@ -371,16 +445,19 @@ watch(() => state.current && state.current.chapter, async () => {
   await nextTick()
   await layout({ keepPage: false })
   if (pendingPage !== null) {
-    const p = pendingPage
+    const p = pendingPage // -1 means "the last page" (paging backwards into a chapter)
     pendingPage = null
     page.value = 0
-    setPage(p)
+    setPage(p < 0 ? pages.value - 1 : p)
   }
   await flushFrag()
   if (isPdf.value) renderCurrentPdf()
 })
 watch(() => state.fontScale, () => layout({ keepPage: true }))
 watch([showFind], () => { if (!showFind.value) findQ.value = '' })
+// focus mode (re)mounts the chrome around the page, so the column is re-measured
+watch(() => state.focus, async () => { await nextTick(); await layout({ keepPage: true }) })
+watch(() => state.current && state.current.book && state.current.book.id, () => { pageFlags.value = [] })
 
 onMounted(async () => {
   window.addEventListener('keydown', onKey)
@@ -390,7 +467,7 @@ onMounted(async () => {
       layout({ keepPage: true })
       if (isPdf.value) schedulePdfRender()
     })
-    ro.observe(vp.value)
+    ro.observe(room.value)
   } else {
     window.addEventListener('resize', onResize)
   }
@@ -414,9 +491,12 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
 </script>
 
 <template>
-  <div class="reader" v-if="chapter">
+  <div class="reader" v-if="chapter" :class="{ focus: state.focus }">
+    <!-- focus mode: a hairline that shows how far through the book you are -->
+    <div v-if="state.focus" class="focusline" aria-hidden="true"><i :style="{ width: percent + '%' }"></i></div>
+
     <!-- contents / find -->
-    <nav class="toccol" v-if="showToc" aria-label="Contents">
+    <nav class="toccol" v-if="showToc && !state.focus" aria-label="Contents">
       <template v-if="!showFind">
       <div class="toc">
         <div class="th">Contents</div>
@@ -458,8 +538,8 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
 
     <!-- page -->
     <div class="pagewrap">
-      <div class="readbar">
-        <button class="iconbtn" :class="{ on: showToc }" title="Toggle contents" aria-label="Toggle contents" @click="showToc = !showToc">
+      <div class="readbar" v-if="!state.focus">
+        <button class="iconbtn" :class="{ on: showToc }" title="Toggle contents (t)" aria-label="Toggle contents" @click="showToc = !showToc">
           <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10" /></svg>
         </button>
         <button class="iconbtn" :class="{ on: showFind }" title="Find in book" aria-label="Find in book" @click="showFind = !showFind">
@@ -471,32 +551,44 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
             <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
           </button>
           <button class="iconbtn" :class="{ on: bookmarked }"
-            :title="bookmarked ? 'Remove bookmark' : 'Bookmark this page'"
+            :title="bookmarked ? 'Remove bookmark (b)' : 'Bookmark this page (b)'"
             :aria-label="bookmarked ? 'Remove bookmark' : 'Bookmark this page'" @click="toggleBm">
             <svg viewBox="0 0 24 24"><path d="M7 4h10v16l-5-4-5 4z" :fill="bookmarked ? 'currentColor' : 'none'"/></svg>
           </button>
-          <button class="iconbtn" title="Smaller text" aria-label="Smaller text" @click="setFontScale(-0.1)">
+          <button class="iconbtn" title="Smaller text (−)" aria-label="Smaller text" @click="setFontScale(-0.1)">
             <svg viewBox="0 0 24 24"><path d="M5 12h14" /></svg>
           </button>
-          <button class="iconbtn" title="Larger text" aria-label="Larger text" @click="setFontScale(0.1)">
+          <button class="iconbtn" title="Larger text (+)" aria-label="Larger text" @click="setFontScale(0.1)">
             <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
+          </button>
+          <button class="iconbtn" title="Focus mode (f)" aria-label="Focus mode" @click="toggleFocusMode">
+            <svg viewBox="0 0 24 24"><path d="M9 4H4v5M15 4h5v5M15 20h5v-5M9 20H4v-5" /></svg>
+          </button>
+          <button class="iconbtn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts" @click="showHelp = !showHelp">
+            <svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h.01M11 10h.01M15 10h.01M8 14h8"/></svg>
           </button>
           <span class="notecount" title="Notes in this chapter">{{ bookNotesCount }} notes</span>
         </span>
       </div>
 
-      <div class="viewport" ref="vp" @mouseup="onSelect" @click="onBodyClick">
-        <article v-if="!isPdf" class="flow" ref="flow" :style="{ fontSize: 16.5 * state.fontScale + 'px' }">
-          <div class="chnum">Chapter {{ idx + 1 }}</div>
-          <h3>{{ chapterTitle }}</h3>
-          <div class="body" ref="body" v-html="chapter.html"></div>
-          <div class="flags" aria-hidden="true">
-            <i v-for="n in chapterNotes" :key="n.id" class="flag"
-              :class="{ active: n.id === activeNoteId }"
-              :style="{ background: COLORS[n.color] || COLORS.sun, top: Math.min(97, Math.max(0, (n.start / bodyLen) * 100)) + '%' }"
-              @click="onNoteSelect(n.id)"></i>
-          </div>
-        </article>
+      <div class="viewport" ref="room" :class="{ framed }" @mouseup="onSelect" @click="onBodyClick">
+        <!-- page-edge flags for the highlights on this page (pagebox gutter) -->
+        <div v-if="framed && pageFlags.length" class="flags" aria-hidden="true">
+          <i v-for="f in pageFlags" :key="f.id" class="flag"
+            :class="{ active: f.id === activeNoteId }"
+            :style="{ background: COLORS[f.color] || COLORS.sun, top: f.top + '%' }"
+            :title="f.quote"
+            @click="onNoteSelect(f.id)"></i>
+        </div>
+
+        <!-- exactly one page wide: the rest of the chapter is clipped away -->
+        <div v-if="!isPdf" class="pagebox" ref="vp">
+          <article class="flow" ref="flow" :style="{ fontSize: 16.5 * state.fontScale + 'px' }">
+            <div class="chnum">Chapter {{ idx + 1 }}</div>
+            <h3>{{ chapterTitle }}</h3>
+            <div class="body" ref="body" v-html="chapter.html"></div>
+          </article>
+        </div>
         <canvas v-else ref="pdfCanvas" class="pdfcanvas" aria-label="PDF page"></canvas>
 
         <div v-if="selection" class="pop" :style="popStyle" role="toolbar" aria-label="Highlight actions" @mousedown.prevent>
@@ -516,9 +608,16 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
         <button class="edge r" title="Next page" aria-label="Next page" @click="nextPage">
           <svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7" /></svg>
         </button>
+
+        <!-- the only chrome left in focus mode: a way back, and where you are -->
+        <button v-if="state.focus" class="fexit" title="Exit focus mode (Esc)" aria-label="Exit focus mode" @click="toggleFocusMode">
+          <svg viewBox="0 0 24 24"><path d="M9 4H4v5M15 4h5v5M15 20h5v-5M9 20H4v-5" /></svg>
+          <span>Esc</span>
+        </button>
+        <span v-if="state.focus" class="fpos">{{ percent }}%</span>
       </div>
 
-      <div class="scrub">
+      <div class="scrub" v-if="!state.focus">
         <span class="pct">{{ percent }}%</span>
         <div class="bar" role="slider" aria-label="Reading position" :aria-valuenow="percent" aria-valuemin="0" aria-valuemax="100" @click="scrub">
           <i :style="{ width: percent + '%' }"></i>
@@ -529,6 +628,7 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
     </div>
 
     <MarginaliaPanel
+      v-if="!state.focus"
       :notes="chapterNotes"
       :active-id="activeNoteId"
       :editing-id="editingId"
@@ -536,10 +636,52 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
       @select="onNoteSelect"
       @stop-edit="stopEdit"
     />
+
+    <!-- keyboard reference -->
+    <div v-if="showHelp" class="helpsheet" @click.self="showHelp = false">
+      <div class="helpcard" role="dialog" aria-label="Keyboard shortcuts">
+        <div class="hh">
+          <span>Keyboard</span>
+          <button class="iconbtn" title="Close" aria-label="Close" @click="showHelp = false">
+            <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" /></svg>
+          </button>
+        </div>
+        <dl>
+          <div><dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Previous / next page</dd></div>
+          <div><dt><kbd>Space</kbd></dt><dd>Next page</dd></div>
+          <div><dt><kbd>Home</kbd> <kbd>End</kbd></dt><dd>First / last page of the chapter</dd></div>
+          <div><dt><kbd>f</kbd></dt><dd>Focus mode — just this page</dd></div>
+          <div><dt><kbd>t</kbd></dt><dd>Contents</dd></div>
+          <div><dt><kbd>b</kbd></dt><dd>Bookmark this page</dd></div>
+          <div><dt><kbd>+</kbd> <kbd>−</kbd></dt><dd>Text size</dd></div>
+          <div><dt><kbd>Esc</kbd></dt><dd>Leave focus mode / close panels</dd></div>
+          <div><dt><kbd>?</kbd></dt><dd>This list</dd></div>
+        </dl>
+        <p class="fnote">Select text to highlight it or leave a note.</p>
+      </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
+/* ---------- reader shell: contents | page | marginalia ---------- */
+.reader {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; align-items: stretch;
+  position: relative; overflow: hidden;
+}
+
+/* focus mode: a hairline progress mark, everything else invisible */
+.focusline {
+  position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  z-index: 20; pointer-events: none;
+}
+.focusline i {
+  display: block; height: 100%;
+  background: color-mix(in srgb, var(--ink) 40%, transparent);
+  transition: width .25s ease;
+}
+
 /* ---------- contents / find column ---------- */
 .toccol {
   width: 224px; flex: none;
@@ -597,7 +739,28 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
   padding: 3px 9px; margin-left: 6px; white-space: nowrap;
 }
 
-.viewport { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+/* ---------- reading room + the page itself ---------- */
+.viewport {
+  position: relative; flex: 1; min-height: 0;
+  overflow: hidden;              /* nothing outside the page can be seen */
+  display: flex; justify-content: center;
+  padding: 10px 0;
+}
+/* The page: a box exactly one page wide that clips the column flow. The flow is
+   many columns long and is moved with a transform, so the next page can never
+   be seen past this edge — no scrollbar, no sliver, no half page. */
+.pagebox {
+  position: relative; flex: none;
+  height: 100%; overflow: hidden;
+  background: var(--paper);
+}
+.viewport.framed .pagebox {
+  border-radius: 3px;
+  box-shadow:
+    0 0 0 1px var(--line),
+    0 1px 2px color-mix(in srgb, var(--ink) 6%, transparent),
+    0 14px 34px color-mix(in srgb, var(--ink) 9%, transparent);
+}
 
 .flow {
   margin: 0 auto;
@@ -608,6 +771,8 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
   color: var(--ink);
   position: relative;
   padding: 30px 0 10px;
+  will-change: transform;
+  backface-visibility: hidden;
 }
 .chnum { font-family: var(--sans); font-size: 12px; color: var(--ink-faint); margin-bottom: 4px; }
 .flow h3 {
@@ -618,6 +783,11 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
 /* book content (v-html) */
 .body { position: relative; }
 .body :deep(p) { margin-bottom: 1.15em; orphans: 2; widows: 2; }
+/* highlights that come with the book itself, in the app's own highlighter */
+.body :deep(mark:not(.hl)) {
+  background: color-mix(in srgb, var(--sun) 65%, transparent);
+  color: inherit; padding: 0 .08em; border-radius: 2px;
+}
 .body :deep(p:first-child)::first-letter { font-size: 2.4em; line-height: .9; float: left; padding: .06em .09em 0 0; font-weight: 500; }
 .body :deep(h1), .body :deep(h2), .body :deep(h4) {
   font-family: var(--serif); font-weight: 600; line-height: 1.3;
@@ -664,17 +834,70 @@ const COLORS = { sun: 'var(--sun)', mint: 'var(--mint)', sky: 'var(--sky)', rose
 .body :deep(mark.hl.active) { outline: 1px solid var(--ink); outline-offset: 1px; }
 .viewport ::selection { background: color-mix(in srgb, var(--sun) 45%, transparent); }
 
-/* page-edge flags */
+/* page-edge flags: the highlights on the page you are reading, in the gutter */
 .flags {
-  position: absolute; top: 70px; right: -3px; bottom: 30px;
+  position: absolute; z-index: 6;
+  top: 10px; bottom: 10px;
+  right: max(2px, calc((100% - var(--pagew, 620px)) / 2 - 20px));
   width: 16px; pointer-events: none;
 }
 .flag {
   position: absolute; right: 0;
   display: block; width: 16px; height: 5px; border-radius: 0 3px 3px 0;
   pointer-events: auto; cursor: pointer; opacity: .85;
+  border: 0; padding: 0;
 }
 .flag:hover, .flag.active { width: 22px; opacity: 1; }
+
+/* focus mode chrome: a quiet way out and where you are */
+.fexit {
+  position: absolute; right: 14px; bottom: 10px; z-index: 22;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 26px; padding: 0 10px; border-radius: 14px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink-soft);
+  font-size: 11.5px; opacity: .45;
+  transition: opacity .15s ease;
+}
+.viewport:hover .fexit, .fexit:focus-visible { opacity: 1; }
+.fexit svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.fpos {
+  position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%);
+  z-index: 22; font-size: 11.5px; color: var(--ink-faint);
+  font-variant-numeric: tabular-nums; pointer-events: none; opacity: .7;
+}
+
+/* keyboard reference */
+.helpsheet {
+  position: fixed; inset: 0; z-index: 90;
+  display: grid; place-items: center; padding: 24px;
+  background: color-mix(in srgb, var(--ink) 22%, transparent);
+  animation: fade .12s ease-out;
+}
+.helpcard {
+  width: 366px; max-width: 100%;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: var(--shadow-menu);
+  padding: 14px 16px 14px;
+}
+.hh {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--ink-faint); margin-bottom: 8px;
+}
+.helpcard dl { display: flex; flex-direction: column; gap: 7px; }
+.helpcard dl > div { display: flex; align-items: baseline; gap: 10px; }
+.helpcard dt { flex: none; width: 112px; display: flex; align-items: center; gap: 4px; }
+.helpcard dd { font-size: 12.5px; color: var(--ink-soft); }
+.helpcard kbd {
+  font-family: var(--sans); font-size: 11px; line-height: 1;
+  padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
+  border-radius: 4px; background: var(--chrome); color: var(--ink);
+}
+.fnote {
+  margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line);
+  font-size: 12px; color: var(--ink-faint);
+}
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 
 /* selection popover */
 .pop {

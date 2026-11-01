@@ -49,7 +49,7 @@ init()
 </script>
 
 <template>
-  <div class="shell">
+  <div class="shell" :class="{ focus: state.focus && state.view === 'reader' }">
     <nav class="rail" aria-label="Main">
       <div class="logo" aria-hidden="true">M</div>
       <button

@@ -5,8 +5,18 @@ import { DOMParser } from '@xmldom/xmldom'
 import { parseEpub, resolvePath, zipDir } from '../src/lib/epub.js'
 import { buildSampleEpub } from '../src/lib/sample.js'
 import { absOffset, locate, textLength, unwrapMarks } from '../src/lib/marks.js'
+import { parseBook } from '../src/lib/formats.js'
 
 const enc = new TextEncoder()
+
+test('parseBook: a .epub zip routes to the EPUB parser instead of being rejected', async () => {
+  const bytes = buildSampleEpub()
+  const book = await parseBook(bytes, 'the-salt-path-sample.epub')
+  assert.equal(book.format, 'epub')
+  assert.equal(book.title, 'The Salt Path')
+  assert.equal(book.chapters.length, 3)
+  assert.equal(book.toc[0].label, '1. The letting go')
+})
 
 test('parseEpub: sample book metadata, spine, toc, cover', () => {
   const book = parseEpub(buildSampleEpub())
